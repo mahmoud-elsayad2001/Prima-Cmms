@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { X, Upload, Loader2, FileText, Image as ImageIcon, Download } from 'lucide-react'
 import QRCode from 'qrcode'
-import { STATUS, PRIORITY } from '../lib/domain'
+import { STATUS, PRIORITY, FAULT_CAUSES } from '../lib/domain'
 import { uploadFile, mediaUrl } from '../lib/supabase'
 
 export function StatusBadge({ status }) {
@@ -174,3 +174,14 @@ export function Kennzahl({ wert, label, ton = 'text-ink', icon: Icon }) {
 }
 
 export { ImageIcon }
+
+/** Auswahl "Grund der Störung" (entspricht dem ENUM fault_cause_kind). */
+export function GrundSelect({ value, onChange, disabled, leer = 'Bitte wählen', id }) {
+  return (
+    <select id={id} className="field" value={value || ''} disabled={disabled}
+            onChange={(e) => onChange(e.target.value)}>
+      <option value="">{leer}</option>
+      {Object.entries(FAULT_CAUSES).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+    </select>
+  )
+}

@@ -8,6 +8,7 @@ import { useAuth } from '../lib/auth'
 import { supabase } from '../lib/supabase'
 import { alarm, tonAktiv, tonUmschalten, audioFreischalten } from '../lib/sound'
 import { InstallButton } from './install'
+import SchemaHinweis from './SchemaHinweis'
 
 const nav = [
   { to: '/',          label: 'Übersicht',  icon: LayoutDashboard, end: true },
@@ -86,6 +87,8 @@ export default function Layout({ children }) {
           <span className="ml-2 opacity-80">({hinweis.prio})</span>
         </button>
       )}
+
+      <SchemaHinweis />
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 pb-28 pt-4 md:pb-10">{children}</main>
 
