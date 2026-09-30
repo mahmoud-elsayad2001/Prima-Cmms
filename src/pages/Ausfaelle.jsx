@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Download, Timer, ArrowLeft } from 'lucide-react'
 import { supabase } from '../lib/supabase'
-import { fmtDateTime, fmtHours, effektiveAusfallzeit } from '../lib/domain'
+import { fmtDateTime, fmtHours, effektiveAusfallzeit, grundText } from '../lib/domain'
+import { fehlerText } from '../lib/fehler'
 import { exportCsv } from '../lib/csv'
 import { Spinner, Empty, Fehler, Kennzahl } from '../components/ui'
 
@@ -14,14 +15,16 @@ export default function Ausfaelle() {
 
   useEffect(() => {
     supabase.from('v_downtime').select('*').order('downtime_start', { ascending: false })
-      .then(({ data, error }) => { if (error) setFehler(error.message); setZeilen(data ?? []) })
+      .then(({ data, error }) => { if (error) setFehler(fehlerText(error)); setZeilen(data ?? []) })
   }, [])
 
+  const laeuft = (z) => z.machine_status === 'stillstand' && z.status !== 'abgeschlossen'
+
   const gefiltert = useMemo(
-    () => (zeilen ?? []).filter((z) => !nurLaufend || z.machine_status === 'stillstand'),
+    () => (zeilen ?? []).filter((z) => !nurLaufend || laeuft(z)),
     [zeilen, nurLaufend])
 
-  const proMaschine = useMemo(() => {
+  const proObjekt = useMemo(() => {
     const map = new Map()
     ;(zeilen ?? []).forEach((z) => {
       const k = z.machine_name || `${z.room_name} (Raum)`
@@ -32,10 +35,10 @@ export default function Ausfaelle() {
     return [...map.values()].sort((a, b) => b.stunden - a.stunden)
   }, [zeilen])
 
-  if (!zeilen) return <Spinner text="Ausfälle werden geladen" />
+  if (!zeilen) return fehler ? <Fehler text={fehler} /> : <Spinner text="Ausfälle werden geladen" />
 
-  const gesamt = (zeilen ?? []).reduce((s, z) => s + effektiveAusfallzeit(z), 0)
-  const laufend = zeilen.filter((z) => z.machine_status === 'stillstand').length
+  const gesamt = zeilen.reduce((s, z) => s + effektiveAusfallzeit(z), 0)
+  const aktuell = zeilen.filter(laeuft).length
 
   function csv() {
     exportCsv(`ausfallzeiten-${new Date().toISOString().slice(0, 10)}`, gefiltert.map((z) => ({
@@ -43,10 +46,10 @@ export default function Ausfaelle() {
       Maschine: z.machine_name || '',
       Abteilung: z.department_name,
       Raum: z.room_name,
-      Grund: z.fault_reason || '',
+      'Grund der Störung': grundText(z),
       Beginn: fmtDateTime(z.downtime_start),
       Ende: z.downtime_end ? fmtDateTime(z.downtime_end) : 'läuft',
-      'Dauer (h)': String(effektiveAusfallzeit(z).toFixed(2)).replace('.', ',')
+      'Dauer (Min.)': String(Math.round(effektiveAusfallzeit(z) * 600) / 10).replace('.', ',')
     })))
   }
 
@@ -64,29 +67,29 @@ export default function Ausfaelle() {
       </div>
 
       <div className="grid grid-cols-3 gap-3">
-        <Kennzahl wert={fmtHours(gesamt)} label="Ausfallstunden gesamt" ton="text-stop" />
+        <Kennzahl wert={fmtHours(gesamt)} label="Ausfallzeit gesamt" ton="text-stop" />
         <Kennzahl wert={zeilen.length} label="Erfasste Ausfälle" />
-        <Kennzahl wert={laufend} label="Aktuell im Stillstand" ton={laufend ? 'text-stop' : 'text-ink'} />
+        <Kennzahl wert={aktuell} label="Aktuell im Stillstand" ton={aktuell ? 'text-stop' : 'text-ink'} />
       </div>
 
       <button onClick={() => setNurLaufend(!nurLaufend)}
               className={`min-h-[44px] w-full rounded-card text-sm font-semibold
-                          ${nurLaufend ? 'bg-stop text-white' : 'bg-white border border-black/10 text-steel'}`}>
+                          ${nurLaufend ? 'bg-stop text-white' : 'border border-black/10 bg-white text-steel'}`}>
         {nurLaufend ? 'Alle Ausfälle anzeigen' : 'Nur laufende Stillstände'}
       </button>
 
       <Fehler text={fehler} />
 
-      {proMaschine.length > 0 && (
+      {proObjekt.length > 0 && (
         <section className="card">
           <header className="border-b border-black/10 px-4 py-3"><h2 className="font-semibold">Summe je Objekt</h2></header>
           <ul className="divide-y divide-black/[0.06]">
-            {proMaschine.map((m) => (
+            {proObjekt.map((m) => (
               <li key={m.name} className="flex items-center justify-between px-4 py-2.5">
                 <span className="font-medium">{m.name}</span>
                 <span className="text-right">
                   <span className="num block font-semibold">{fmtHours(m.stunden)}</span>
-                  <span className="num block text-[12px] text-steel">{m.anzahl} Ausfälle</span>
+                  <span className="num block text-[12px] text-steel">{m.anzahl} {m.anzahl === 1 ? 'Ausfall' : 'Ausfälle'}</span>
                 </span>
               </li>
             ))}
@@ -98,34 +101,31 @@ export default function Ausfaelle() {
         <Empty title="Keine Ausfälle erfasst" hint="Sobald eine Störung mit Stillstand gemeldet wird, erscheint sie hier." />
       ) : (
         <ul className="space-y-2">
-          {gefiltert.map((z) => {
-            const laeuft = z.machine_status === 'stillstand'
-            return (
-              <li key={z.id}>
-                <button onClick={() => navigate(`/auftraege/${z.id}`)}
-                        className="card w-full p-4 text-left hover:border-ink/20">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="truncate font-semibold">{z.machine_name || z.room_name}</p>
-                      <p className="text-[13px] text-steel">{z.department_name} · {z.room_name}</p>
-                      <p className="mt-1 text-[13px]">{z.fault_reason || 'Ohne Angabe'}</p>
-                      <p className="text-[12px] text-steel">
-                        {fmtDateTime(z.downtime_start)} bis {z.downtime_end ? fmtDateTime(z.downtime_end) : 'jetzt'}
-                      </p>
-                    </div>
-                    <span className={`num shrink-0 text-right text-lg font-bold ${laeuft ? 'text-stop' : 'text-ink'}`}>
-                      {fmtHours(effektiveAusfallzeit(z))}
-                      {laeuft && (
-                        <span className="block text-[11px] font-semibold">
-                          <Timer className="mr-0.5 inline h-3 w-3" />läuft
-                        </span>
-                      )}
-                    </span>
+          {gefiltert.map((z) => (
+            <li key={z.id}>
+              <button onClick={() => navigate(`/auftraege/${z.id}`)}
+                      className="card w-full p-4 text-left hover:border-ink/20">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate font-semibold">{z.machine_name || z.room_name}</p>
+                    <p className="text-[13px] text-steel">{z.department_name} · {z.room_name}</p>
+                    <p className="mt-1 text-[13px]">{grundText(z)}</p>
+                    <p className="text-[12px] text-steel">
+                      {fmtDateTime(z.downtime_start)} bis {z.downtime_end ? fmtDateTime(z.downtime_end) : 'jetzt'}
+                    </p>
                   </div>
-                </button>
-              </li>
-            )
-          })}
+                  <span className={`num shrink-0 text-right text-lg font-bold ${laeuft(z) ? 'text-stop' : 'text-ink'}`}>
+                    {fmtHours(effektiveAusfallzeit(z))}
+                    {laeuft(z) && (
+                      <span className="block text-[11px] font-semibold">
+                        <Timer className="mr-0.5 inline h-3 w-3" />läuft
+                      </span>
+                    )}
+                  </span>
+                </div>
+              </button>
+            </li>
+          ))}
         </ul>
       )}
     </div>

@@ -1,15 +1,23 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  ComposedChart, Line, Legend, Cell
+  ComposedChart, Line, Legend, LabelList, PieChart, Pie, Cell
 } from 'recharts'
 import { Download } from 'lucide-react'
 import { supabase } from '../lib/supabase'
-import { fmtDate, fmtHours, STATUS, PRIORITY, effektiveAusfallzeit } from '../lib/domain'
+import {
+  fmtDate, fmtDauer, STATUS, PRIORITY, ausfallSekunden, arbeitsSekunden, chartEinheit,
+  grundLabel, grundText, median
+} from '../lib/domain'
+import { fehlerText } from '../lib/fehler'
 import { exportCsv } from '../lib/csv'
 import { Spinner, Empty, Kennzahl, Fehler } from '../components/ui'
 
 const FARBEN = { ink: '#0E1A24', signal: '#F2A007', stop: '#C0392B', run: '#1F6FEB', done: '#0F7A5A', steel: '#5A6B7A' }
+const PALETTE = ['#C0392B', '#1F6FEB', '#F2A007', '#0F7A5A', '#8E44AD', '#16A085', '#0E1A24', '#D35400']
+const GRAU = '#9AA5B1'
+
+const kuerzen = (t, n = 18) => (t && t.length > n ? `${t.slice(0, n - 1)}…` : t)
 
 export default function Berichte() {
   const [orders, setOrders] = useState(null)
@@ -19,9 +27,9 @@ export default function Berichte() {
 
   useEffect(() => {
     supabase.from('work_orders')
-      .select('*, machines(name), rooms(name,department_id,departments(name))')
+      .select('*, machines(name), rooms(name,departments(name))')
       .order('created_at', { ascending: false })
-      .then(({ data, error }) => { if (error) setFehler(error.message); setOrders(data ?? []) })
+      .then(({ data, error }) => { if (error) setFehler(fehlerText(error)); setOrders(data ?? []) })
   }, [])
 
   const abteilungen = useMemo(
@@ -43,70 +51,87 @@ export default function Berichte() {
     const map = new Map()
     basis.forEach((o) => {
       const k = o.machines?.name || `${o.rooms?.name} (Raum)`
-      const e = map.get(k) || { name: k, stunden: 0, ungeplant: 0, gesamt: 0 }
-      e.stunden += effektiveAusfallzeit(o)
+      const e = map.get(k) || { name: k, sekunden: 0, ungeplant: 0, gesamt: 0 }
+      e.sekunden += ausfallSekunden(o)
       e.gesamt += 1
       if (o.kind === 'unplanmaessig') e.ungeplant += 1
       map.set(k, e)
     })
-    return [...map.values()].sort((a, b) => b.stunden - a.stunden)
+    return [...map.values()]
   }, [basis])
 
-  const proAbteilung = useMemo(() => {
+  const ausfallMaschine = useMemo(
+    () => proMaschine.filter((m) => m.sekunden > 0).sort((a, b) => b.sekunden - a.sekunden).slice(0, 10), [proMaschine])
+
+  const ausfallAbteilung = useMemo(() => {
     const map = new Map()
     basis.forEach((o) => {
       const k = o.rooms?.departments?.name || 'Ohne Zuordnung'
-      map.set(k, (map.get(k) || 0) + effektiveAusfallzeit(o))
+      map.set(k, (map.get(k) || 0) + ausfallSekunden(o))
     })
-    return [...map.entries()].map(([name, stunden]) => ({ name, stunden })).sort((a, b) => b.stunden - a.stunden)
+    return [...map.entries()].map(([name, sekunden]) => ({ name, sekunden }))
+      .filter((a) => a.sekunden > 0).sort((a, b) => b.sekunden - a.sekunden)
   }, [basis])
 
-  const pareto = useMemo(() => {
+  const ursachen = useMemo(() => {
     const map = new Map()
     basis.filter((o) => o.kind === 'unplanmaessig').forEach((o) => {
-      const k = o.failure_cause || 'Ohne Angabe'
-      map.set(k, (map.get(k) || 0) + 1)
+      const k = o.fault_cause || 'ohne'
+      const e = map.get(k) || { key: k, label: grundLabel(o.fault_cause), anzahl: 0, sekunden: 0 }
+      e.anzahl += 1; e.sekunden += ausfallSekunden(o)
+      map.set(k, e)
     })
-    const liste = [...map.entries()].map(([ursache, anzahl]) => ({ ursache, anzahl })).sort((a, b) => b.anzahl - a.anzahl)
+    const liste = [...map.values()].sort((a, b) => b.anzahl - a.anzahl)
     const gesamt = liste.reduce((s, e) => s + e.anzahl, 0) || 1
     let kum = 0
-    return liste.map((e) => { kum += e.anzahl; return { ...e, kumuliert: Math.round((kum / gesamt) * 100) } })
+    return liste.map((e, i) => {
+      kum += e.anzahl
+      return {
+        ...e, anteil: Math.round((e.anzahl / gesamt) * 100), kumuliert: Math.round((kum / gesamt) * 100),
+        farbe: e.key === 'ohne' ? GRAU : PALETTE[i % PALETTE.length]
+      }
+    })
   }, [basis])
 
   const topUngeplant = useMemo(
     () => [...proMaschine].sort((a, b) => b.ungeplant - a.ungeplant).filter((m) => m.ungeplant > 0).slice(0, 8),
     [proMaschine])
 
-  if (!orders) return <Spinner text="Auswertung wird erstellt" />
+  if (!orders) return fehler ? <Fehler text={fehler} /> : <Spinner text="Auswertung wird erstellt" />
 
-  const gesamtStunden = basis.reduce((s, o) => s + effektiveAusfallzeit(o), 0)
-  const ungeplant = basis.filter((o) => o.kind === 'unplanmaessig').length
-  const quote = basis.length ? Math.round((ungeplant / basis.length) * 100) : 0
+  const gesamtSek = basis.reduce((s, o) => s + ausfallSekunden(o), 0)
+  const ungeplant = basis.filter((o) => o.kind === 'unplanmaessig')
+  const reparaturen = ungeplant.map((o) => arbeitsSekunden(o)).filter((s) => s > 0)
+  const stoerungenMitUrsache = ursachen.reduce((s, e) => s + e.anzahl, 0)
+
+  const min = (sek) => String(Math.round((sek / 60) * 10) / 10).replace('.', ',')
 
   function csvAuftraege() {
     exportCsv(`monatsbericht-${new Date().toISOString().slice(0, 7)}`, basis.map((o) => ({
       Auftragsnummer: o.order_no,
       Art: o.kind === 'planmaessig' ? 'Planmäßig' : 'Unplanmäßig',
-      Titel: o.title,
+      Bezeichnung: o.title,
       Maschine: o.machines?.name || '',
       Abteilung: o.rooms?.departments?.name,
       Raum: o.rooms?.name,
-            Status: STATUS[o.status].label,
+      Status: STATUS[o.status].label,
       Priorität: PRIORITY[o.priority].label,
-      Fehlerursache: o.failure_cause || 'Ohne Angabe',
-      'Ausfallzeit (h)': String(o.downtime_hours).replace('.', ','),
+      'Grund der Störung': o.kind === 'unplanmaessig' ? grundText(o) : '',
+      'Ausfallzeit (Min.)': min(ausfallSekunden(o)),
+      'Reparaturdauer (Min.)': min(arbeitsSekunden(o)),
       Reparaturdatum: o.repair_date || '',
       'Getauschte Ersatzteile': (o.replaced_parts || []).join(' | ')
     })))
   }
 
   function csvAuswertung() {
-    exportCsv(`ausfallzeiten-${new Date().toISOString().slice(0, 10)}`, proMaschine.map((m) => ({
-      Maschine: m.name,
-      'Ausfallzeit (h)': String(m.stunden.toFixed(1)).replace('.', ','),
-      'Ungeplante Ausfälle': m.ungeplant,
-      'Aufträge gesamt': m.gesamt
-    })))
+    exportCsv(`ausfallzeiten-${new Date().toISOString().slice(0, 10)}`, proMaschine
+      .sort((a, b) => b.sekunden - a.sekunden).map((m) => ({
+        Maschine: m.name,
+        'Ausfallzeit (Min.)': min(m.sekunden),
+        'Ungeplante Ausfälle': m.ungeplant,
+        'Aufträge gesamt': m.gesamt
+      })))
   }
 
   return (
@@ -139,54 +164,89 @@ export default function Berichte() {
       <Fehler text={fehler} />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kennzahl wert={fmtHours(gesamtStunden)} label="Ausfallzeit gesamt" />
+        <Kennzahl wert={fmtDauer(gesamtSek)} label="Ausfallzeit gesamt" />
         <Kennzahl wert={basis.length} label="Aufträge im Zeitraum" />
-        <Kennzahl wert={ungeplant} label="Ungeplante Eingriffe" ton="text-stop" />
-        <Kennzahl wert={`${quote} %`} label="Anteil ungeplant" />
+        <Kennzahl wert={ungeplant.length} label="Ungeplante Eingriffe" ton="text-stop" />
+        <Kennzahl wert={reparaturen.length ? fmtDauer(median(reparaturen)) : '–'} label="Reparaturdauer (Median)" />
       </div>
 
       {basis.length === 0 ? (
         <Empty title="Keine Daten im gewählten Zeitraum" hint="Zeitraum erweitern oder Abteilungsfilter zurücksetzen." />
       ) : (
         <>
-          <Diagramm titel="Ausfallzeiten nach Maschine (Stunden)">
-            <ResponsiveContainer width="100%" height={Math.max(240, proMaschine.slice(0, 10).length * 38)}>
-              <BarChart data={proMaschine.slice(0, 10)} layout="vertical" margin={{ left: 8, right: 16 }}>
-                <CartesianGrid horizontal={false} stroke="#0E1A2410" />
-                <XAxis type="number" tick={{ fontSize: 12, fill: FARBEN.steel }} />
-                <YAxis type="category" dataKey="name" width={130} tick={{ fontSize: 12, fill: FARBEN.ink }} />
-                <Tooltip formatter={(v) => fmtHours(v)} cursor={{ fill: '#0E1A2408' }} />
-                <Bar dataKey="stunden" name="Ausfallzeit" fill={FARBEN.ink} radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <Diagramm titel="Ausfallzeiten nach Maschine">
+            {ausfallMaschine.length === 0
+              ? <Leer />
+              : <DauerBalken daten={ausfallMaschine} horizontal farbe={FARBEN.ink} />}
           </Diagramm>
 
-          <Diagramm titel="Ausfallzeiten nach Abteilung (Stunden)">
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={proAbteilung} margin={{ left: 0, right: 8 }}>
-                <CartesianGrid vertical={false} stroke="#0E1A2410" />
-                <XAxis dataKey="name" tick={{ fontSize: 12, fill: FARBEN.ink }} />
-                <YAxis tick={{ fontSize: 12, fill: FARBEN.steel }} />
-                <Tooltip formatter={(v) => fmtHours(v)} cursor={{ fill: '#0E1A2408' }} />
-                <Bar dataKey="stunden" name="Ausfallzeit" fill={FARBEN.signal} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <Diagramm titel="Ausfallzeiten nach Abteilung">
+            {ausfallAbteilung.length === 0
+              ? <Leer />
+              : <DauerBalken daten={ausfallAbteilung} farbe={FARBEN.signal} />}
+          </Diagramm>
+
+          <Diagramm titel={`Störungsursachen · Anteile (${stoerungenMitUrsache} ${stoerungenMitUrsache === 1 ? 'Störung' : 'Störungen'})`}>
+            {ursachen.length === 0 ? (
+              <p className="text-sm text-steel">Im Zeitraum wurde keine Störung erfasst.</p>
+            ) : (
+              <div className="grid items-center gap-4 md:grid-cols-2">
+                <ResponsiveContainer width="100%" height={240}>
+                  <PieChart>
+                    <Pie data={ursachen} dataKey="anzahl" nameKey="label" innerRadius={55} outerRadius={95}
+                         paddingAngle={2} stroke="#fff">
+                      {ursachen.map((u) => <Cell key={u.key} fill={u.farbe} />)}
+                    </Pie>
+                    <Tooltip formatter={(v, n, p) => [`${v} (${p.payload.anteil} %)`, n]} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[14px]">
+                    <thead>
+                      <tr className="border-b border-black/[0.08] text-left text-[12px] text-steel">
+                        <th className="py-2 pr-2 font-semibold">Grund</th>
+                        <th className="px-2 py-2 text-right font-semibold">Anzahl</th>
+                        <th className="px-2 py-2 text-right font-semibold">Anteil</th>
+                        <th className="py-2 pl-2 text-right font-semibold">Ausfall</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-black/[0.06]">
+                      {ursachen.map((u) => (
+                        <tr key={u.key}>
+                          <td className="py-2 pr-2">
+                            <span className="mr-2 inline-block h-3 w-3 rounded-sm align-middle" style={{ background: u.farbe }} />
+                            <span className="font-medium">{u.label}</span>
+                          </td>
+                          <td className="num px-2 py-2 text-right font-semibold">{u.anzahl}</td>
+                          <td className="num px-2 py-2 text-right text-steel">{u.anteil} %</td>
+                          <td className="num py-2 pl-2 text-right text-steel">{u.sekunden > 0 ? fmtDauer(u.sekunden) : '–'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </Diagramm>
 
           <Diagramm titel="Häufigste Fehlerursachen (Pareto)">
-            <ResponsiveContainer width="100%" height={300}>
-              <ComposedChart data={pareto} margin={{ left: 0, right: 8, bottom: 40 }}>
-                <CartesianGrid vertical={false} stroke="#0E1A2410" />
-                <XAxis dataKey="ursache" angle={-35} textAnchor="end" interval={0}
-                       height={70} tick={{ fontSize: 11, fill: FARBEN.ink }} />
-                <YAxis yAxisId="l" tick={{ fontSize: 12, fill: FARBEN.steel }} allowDecimals={false} />
-                <YAxis yAxisId="r" orientation="right" unit="%" domain={[0, 100]} tick={{ fontSize: 12, fill: FARBEN.steel }} />
-                <Tooltip />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar yAxisId="l" dataKey="anzahl" name="Störungen" fill={FARBEN.stop} radius={[4, 4, 0, 0]} />
-                <Line yAxisId="r" type="monotone" dataKey="kumuliert" name="Kumuliert %" stroke={FARBEN.ink} strokeWidth={2} dot={false} />
-              </ComposedChart>
-            </ResponsiveContainer>
+            {ursachen.length === 0 ? (
+              <p className="text-sm text-steel">Im Zeitraum wurde keine Störung erfasst.</p>
+            ) : (
+              <ResponsiveContainer width="100%" height={300}>
+                <ComposedChart data={ursachen} margin={{ left: 0, right: 8, bottom: 40 }}>
+                  <CartesianGrid vertical={false} stroke="#0E1A2410" />
+                  <XAxis dataKey="label" angle={-35} textAnchor="end" interval={0} height={70}
+                         tick={{ fontSize: 11, fill: FARBEN.ink }} />
+                  <YAxis yAxisId="l" allowDecimals={false} tick={{ fontSize: 12, fill: FARBEN.steel }} />
+                  <YAxis yAxisId="r" orientation="right" unit=" %" domain={[0, 100]} tick={{ fontSize: 12, fill: FARBEN.steel }} />
+                  <Tooltip />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Bar yAxisId="l" dataKey="anzahl" name="Störungen" fill={FARBEN.stop} radius={[4, 4, 0, 0]} minPointSize={3} />
+                  <Line yAxisId="r" type="monotone" dataKey="kumuliert" name="Kumuliert %" stroke={FARBEN.ink} strokeWidth={2} dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            )}
           </Diagramm>
 
           <section className="card">
@@ -211,7 +271,7 @@ export default function Berichte() {
                       <tr key={m.name}>
                         <td className="px-4 py-2.5 font-medium">{m.name}</td>
                         <td className="num px-4 py-2.5 text-right font-semibold text-stop">{m.ungeplant}</td>
-                        <td className="num px-4 py-2.5 text-right">{fmtHours(m.stunden)}</td>
+                        <td className="num px-4 py-2.5 text-right">{m.sekunden > 0 ? fmtDauer(m.sekunden) : '–'}</td>
                         <td className="num px-4 py-2.5 text-right text-steel">{m.gesamt}</td>
                       </tr>
                     ))}
@@ -225,6 +285,61 @@ export default function Berichte() {
     </div>
   )
 }
+
+/**
+ * Balkendiagramm für Zeitdauern. Die Achse wechselt je nach Größenordnung zwischen
+ * Minuten und Stunden, jeder Balken hat ein Mindestmaß und trägt seine genaue Dauer als Beschriftung.
+ */
+function DauerBalken({ daten, horizontal = false, farbe }) {
+  const einheit = chartEinheit(Math.max(0, ...daten.map((d) => d.sekunden)))
+  const punkte = daten.map((d) => ({ ...d, wert: d.sekunden / einheit.teiler }))
+  const domain = [0, (max) => (einheit.key === 'min'
+    ? Math.max(1, Math.ceil(max * 1.15))
+    : Math.max(1, Math.ceil(max * 1.15 * 2) / 2))]
+  const unit = ` ${einheit.kurz}`
+  const tooltip = (v, n, p) => [fmtDauer(p.payload.sekunden), 'Ausfallzeit']
+  const beschriftung = { fontSize: 11, fill: FARBEN.ink }
+
+  if (horizontal) {
+    return (
+      <>
+        <ResponsiveContainer width="100%" height={Math.max(200, punkte.length * 42)}>
+          <BarChart data={punkte} layout="vertical" margin={{ left: 4, right: 78 }}>
+            <CartesianGrid horizontal={false} stroke="#0E1A2410" />
+            <XAxis type="number" domain={domain} allowDecimals={einheit.key !== 'min'} unit={unit}
+                   tick={{ fontSize: 12, fill: FARBEN.steel }} />
+            <YAxis type="category" dataKey="name" width={130} tickFormatter={(v) => kuerzen(v)}
+                   tick={{ fontSize: 12, fill: FARBEN.ink }} />
+            <Tooltip formatter={tooltip} cursor={{ fill: '#0E1A2408' }} />
+            <Bar dataKey="wert" fill={farbe} radius={[0, 4, 4, 0]} minPointSize={4}>
+              <LabelList dataKey="sekunden" position="right" formatter={fmtDauer} style={beschriftung} />
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+        <p className="mt-1 text-[12px] text-steel">Achse in {einheit.key === 'min' ? 'Minuten' : 'Stunden'}</p>
+      </>
+    )
+  }
+  return (
+    <>
+      <ResponsiveContainer width="100%" height={270}>
+        <BarChart data={punkte} margin={{ left: 0, right: 8, top: 22 }}>
+          <CartesianGrid vertical={false} stroke="#0E1A2410" />
+          <XAxis dataKey="name" tickFormatter={(v) => kuerzen(v, 14)} tick={{ fontSize: 12, fill: FARBEN.ink }} />
+          <YAxis domain={domain} allowDecimals={einheit.key !== 'min'} unit={unit} width={64}
+                 tick={{ fontSize: 12, fill: FARBEN.steel }} />
+          <Tooltip formatter={tooltip} cursor={{ fill: '#0E1A2408' }} />
+          <Bar dataKey="wert" fill={farbe} radius={[4, 4, 0, 0]} minPointSize={4}>
+            <LabelList dataKey="sekunden" position="top" formatter={fmtDauer} style={beschriftung} />
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+      <p className="mt-1 text-[12px] text-steel">Achse in {einheit.key === 'min' ? 'Minuten' : 'Stunden'}</p>
+    </>
+  )
+}
+
+const Leer = () => <p className="text-sm text-steel">Im Zeitraum wurde kein Stillstand erfasst.</p>
 
 function Diagramm({ titel, children }) {
   return (

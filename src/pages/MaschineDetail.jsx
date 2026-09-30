@@ -2,11 +2,14 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, QrCode as QrIcon, Pencil, FileText, Camera, History, Printer,
-  ListChecks, Plus, Trash2, Timer
+  ListChecks, Plus, Trash2, Timer, Wrench
 } from 'lucide-react'
-import { supabase, mediaUrl } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/auth'
-import { CYCLES, fmtDate, fmtDateTime, fmtHours, isOverdue, effektiveAusfallzeit } from '../lib/domain'
+import {
+  CYCLES, fmtDate, fmtDateTime, fmtHours, fmtDauer, median, isOverdue, effektiveAusfallzeit, grundText
+} from '../lib/domain'
+import { fehlerText, ersteAbfrage } from '../lib/fehler'
 import { Spinner, Modal, QrCode, FileUpload, MediaListe, StatusBadge, Fehler, Kennzahl } from '../components/ui'
 import { MaschineForm } from './Maschinen'
 import { useStruktur } from '../components/Objektwahl'
@@ -16,8 +19,29 @@ const REITER = [
   { key: 'checkliste', label: 'Wartungsplan' },
   { key: 'dateien',    label: 'Dateien' },
   { key: 'ausfaelle',  label: 'Ausfälle' },
-  { key: 'historie',   label: 'Historie' }
+  { key: 'historie',   label: 'Historie' },
+  { key: 'ersatzteile', label: 'Ersatzteil-Historie' }
 ]
+
+const ERSATZTEIL_FELDER = 'id,order_no,title,status,created_at,completed_at,approved_at,replaced_parts,ausfuehrer:completed_by(full_name),zustaendig:assigned_to(full_name)'
+
+/**
+ * Ersatzteil-Historie: direkt aus work_orders (keine eigene Tabelle).
+ * Filter auf nicht leere replaced_parts in der Datenbank, zur Sicherheit zusätzlich im Client.
+ */
+async function ladeErsatzteile(machineId) {
+  const basis = () => supabase.from('work_orders').select(ERSATZTEIL_FELDER).eq('machine_id', machineId)
+  const res = await ersteAbfrage(
+    () => supabase.from('work_orders')
+      .select(`${ERSATZTEIL_FELDER}, starter:work_started_by(full_name)`)
+      .eq('machine_id', machineId).not('replaced_parts', 'is', null).neq('replaced_parts', '{}')
+      .order('created_at', { ascending: false }),
+    () => basis().order('created_at', { ascending: false })
+  )
+  const zeilen = (res.data ?? []).filter(
+    (r) => Array.isArray(r.replaced_parts) && r.replaced_parts.some((t) => String(t).trim()))
+  return { zeilen, error: res.error }
+}
 
 export default function MaschineDetail() {
   const { id } = useParams()
@@ -29,6 +53,7 @@ export default function MaschineDetail() {
   const [medien, setMedien] = useState([])
   const [historie, setHistorie] = useState([])
   const [vorlage, setVorlage] = useState([])
+  const [ersatzteile, setErsatzteile] = useState([])
   const [reiter, setReiter] = useState('stammdaten')
   const [qrOffen, setQrOffen] = useState(false)
   const [editOffen, setEditOffen] = useState(false)
@@ -36,31 +61,35 @@ export default function MaschineDetail() {
   const [fehler, setFehler] = useState(null)
 
   const laden = useCallback(async () => {
-    const [mm, med, hist, vl] = await Promise.all([
+    const [mm, med, hist, vl, et] = await Promise.all([
       supabase.from('machines_due').select('*').eq('id', id).single(),
       supabase.from('machine_media').select('*').eq('machine_id', id).order('created_at', { ascending: false }),
-      supabase.from('work_orders')
-        .select('id,order_no,title,kind,status,downtime_hours,downtime_start,downtime_end,machine_status,fault_reason,repair_date,created_at,replaced_parts')
-        .eq('machine_id', id).order('created_at', { ascending: false }),
-      supabase.from('machine_checklists').select('*').eq('machine_id', id).order('position')
+      supabase.from('work_orders').select('*').eq('machine_id', id).order('created_at', { ascending: false }),
+      supabase.from('machine_checklists').select('*').eq('machine_id', id).order('position'),
+      ladeErsatzteile(id)
     ])
-    if (mm.error) return setFehler(mm.error.message)
-    setM(mm.data); setMedien(med.data ?? []); setHistorie(hist.data ?? []); setVorlage(vl.data ?? [])
+    if (mm.error) return setFehler(fehlerText(mm.error))
+    setFehler(hist.error ? fehlerText(hist.error) : (et.error ? fehlerText(et.error) : null))
+    setM(mm.data); setMedien(med.data ?? []); setHistorie(hist.data ?? [])
+    setVorlage(vl.data ?? []); setErsatzteile(et.zeilen)
   }, [id])
 
   useEffect(() => { laden() }, [laden])
-  if (!m) return <Spinner text="Maschinenakte wird geladen" />
+  if (!m) return fehler ? <Fehler text={fehler} /> : <Spinner text="Maschinenakte wird geladen" />
 
   const qrText = `${window.location.origin}/maschinen/${m.id}`
   const dokumente = medien.filter((x) => x.kind !== 'foto')
   const fotos = medien.filter((x) => x.kind === 'foto')
   const ausfaelle = historie.filter((h) => h.downtime_start)
   const ausfallSumme = ausfaelle.reduce((s, h) => s + effektiveAusfallzeit(h), 0)
+  const reparaturen = historie
+    .filter((h) => h.kind === 'unplanmaessig' && h.status === 'abgeschlossen' && Number(h.work_seconds) > 0)
+    .map((h) => Number(h.work_seconds))
 
   const medienHinzu = (kind) => async ({ file_path, file_name }) => {
     const { error } = await supabase.from('machine_media')
       .insert({ machine_id: id, kind, file_path, file_name, uploaded_by: user.id })
-    if (error) return setFehler(error.message)
+    if (error) return setFehler(fehlerText(error))
     laden()
   }
 
@@ -69,15 +98,6 @@ export default function MaschineDetail() {
     await supabase.from('machine_checklists')
       .insert({ machine_id: id, label: neuerPunkt.trim(), position: vorlage.length })
     setNeuerPunkt(''); laden()
-  }
-
-  async function punktLoeschen(pid) {
-    await supabase.from('machine_checklists').delete().eq('id', pid)
-    laden()
-  }
-
-  function drucken() {
-    window.print()
   }
 
   return (
@@ -112,10 +132,11 @@ export default function MaschineDetail() {
         )}
       </header>
 
-      <div className="grid grid-cols-3 gap-3 print:hidden">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 print:hidden">
         <Kennzahl wert={historie.length} label="Aufträge gesamt" />
         <Kennzahl wert={ausfaelle.length} label="Ausfälle" ton="text-stop" />
         <Kennzahl wert={fmtHours(ausfallSumme)} label="Ausfallzeit" />
+        <Kennzahl wert={reparaturen.length ? fmtDauer(median(reparaturen)) : '–'} label="Reparaturdauer (Median)" />
       </div>
 
       <Fehler text={fehler} />
@@ -141,7 +162,7 @@ export default function MaschineDetail() {
               <dd className="font-medium">{fmtDate(m.last_maintenance)}</dd></div>
           </dl>
           <div className="mt-4">
-            <p className="label">Ersatzteile</p>
+            <p className="label">Ersatzteile (Stammdaten)</p>
             {m.spare_parts?.length ? (
               <ul className="flex flex-wrap gap-2">
                 {m.spare_parts.map((t) => (
@@ -173,7 +194,8 @@ export default function MaschineDetail() {
               <li key={p.id} className="flex items-center gap-3 rounded-card bg-hall px-3 py-2.5">
                 <span className="num text-[12px] text-steel">{i + 1}</span>
                 <span className="flex-1 text-[14px]">{p.label}</span>
-                <button onClick={() => punktLoeschen(p.id)} aria-label="Punkt entfernen" className="text-stop">
+                <button onClick={async () => { await supabase.from('machine_checklists').delete().eq('id', p.id); laden() }}
+                        aria-label="Punkt entfernen" className="text-stop">
                   <Trash2 className="h-4 w-4" />
                 </button>
               </li>
@@ -182,8 +204,7 @@ export default function MaschineDetail() {
           </ul>
           <div className="mt-3 flex gap-2">
             <input className="field flex-1" value={neuerPunkt} onChange={(e) => setNeuerPunkt(e.target.value)}
-                   placeholder="Neue Wartungsmaßnahme"
-                   onKeyDown={(e) => e.key === 'Enter' && punktHinzu()} />
+                   placeholder="Neue Wartungsmaßnahme" onKeyDown={(e) => e.key === 'Enter' && punktHinzu()} />
             <button onClick={punktHinzu} className="btn-primary"><Plus className="h-5 w-5" /></button>
           </div>
         </section>
@@ -223,12 +244,12 @@ export default function MaschineDetail() {
           ) : (
             <ul className="divide-y divide-black/[0.06]">
               {ausfaelle.map((h) => {
-                const laeuft = h.machine_status === 'stillstand'
+                const laeuft = h.machine_status === 'stillstand' && h.status !== 'abgeschlossen'
                 return (
                   <li key={h.id}>
                     <Link to={`/auftraege/${h.id}`} className="flex items-start justify-between gap-3 px-4 py-3 hover:bg-hall">
                       <span className="min-w-0">
-                        <span className="block font-medium">{h.fault_reason || 'Ohne Angabe'}</span>
+                        <span className="block font-medium">{grundText(h)}</span>
                         <span className="block text-[13px] text-steel">
                           {fmtDateTime(h.downtime_start)} bis {h.downtime_end ? fmtDateTime(h.downtime_end) : 'jetzt'}
                         </span>
@@ -268,8 +289,9 @@ export default function MaschineDetail() {
                     <p className="mt-1 font-medium">{h.title}</p>
                     <p className="text-[13px] text-steel">
                       {fmtDate(h.repair_date || h.created_at)}
+                      {Number(h.work_seconds) > 0 && ` · Reparaturzeit ${fmtDauer(h.work_seconds)}`}
                       {Number(h.downtime_hours) > 0 && ` · Ausfall ${fmtHours(h.downtime_hours)}`}
-                      {h.fault_reason && ` · ${h.fault_reason}`}
+                      {h.kind === 'unplanmaessig' && (h.fault_cause || h.fault_reason) && ` · ${grundText(h)}`}
                     </p>
                     {h.replaced_parts?.length > 0 && (
                       <p className="text-[12px] text-steel">Ersatzteile: {h.replaced_parts.join(', ')}</p>
@@ -278,6 +300,65 @@ export default function MaschineDetail() {
                 </li>
               ))}
             </ul>
+          )}
+        </section>
+      )}
+
+      {reiter === 'ersatzteile' && (
+        <section className="card">
+          <header className="flex items-center justify-between border-b border-black/10 px-4 py-3">
+            <h2 className="flex items-center gap-2 font-semibold"><Wrench className="h-4 w-4" /> Verbaute Ersatzteile</h2>
+            <span className="num text-[13px] text-steel">{ersatzteile.length} {ersatzteile.length === 1 ? 'Eintrag' : 'Einträge'}</span>
+          </header>
+
+          {ersatzteile.length === 0 ? (
+            <p className="p-4 text-sm text-steel">
+              An dieser Maschine wurden bisher keine Ersatzteile getauscht. Einträge entstehen automatisch,
+              sobald in einem Arbeitsauftrag „Getauschte Ersatzteile“ erfasst werden.
+            </p>
+          ) : (
+            <>
+              {/* Tabelle ab Tablet-Breite */}
+              <div className="hidden overflow-x-auto sm:block">
+                <table className="w-full text-[14px]">
+                  <thead>
+                    <tr className="border-b border-black/[0.08] text-left text-[12px] text-steel">
+                      <th className="px-4 py-2 font-semibold">Datum</th>
+                      <th className="px-4 py-2 font-semibold">Getauschte Ersatzteile</th>
+                      <th className="px-4 py-2 font-semibold">Arbeitsauftrag</th>
+                      <th className="px-4 py-2 font-semibold">Techniker</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-black/[0.06]">
+                    {ersatzteile.map((r) => (
+                      <tr key={r.id} className="align-top">
+                        <td className="num whitespace-nowrap px-4 py-2.5">{fmtDate(datumVon(r))}</td>
+                        <td className="px-4 py-2.5 font-medium">{r.replaced_parts.join(', ')}</td>
+                        <td className="px-4 py-2.5">
+                          <Link to={`/auftraege/${r.id}`} className="font-medium text-run">
+                            #{r.order_no} · {r.title}
+                          </Link>
+                        </td>
+                        <td className="px-4 py-2.5">{technikerVon(r)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Karten auf dem Smartphone */}
+              <ul className="divide-y divide-black/[0.06] sm:hidden">
+                {ersatzteile.map((r) => (
+                  <li key={r.id} className="px-4 py-3">
+                    <p className="font-medium">{r.replaced_parts.join(', ')}</p>
+                    <p className="mt-0.5 text-[13px] text-steel">{fmtDate(datumVon(r))} · {technikerVon(r)}</p>
+                    <Link to={`/auftraege/${r.id}`} className="mt-1 block text-[13px] font-medium text-run">
+                      #{r.order_no} · {r.title}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
         </section>
       )}
@@ -293,7 +374,7 @@ export default function MaschineDetail() {
             <p className="mb-4 text-[13px] text-steel">{m.department_name} · {m.room_name}</p>
             <QrCode text={qrText} filename={`qr-${m.name.replace(/\s+/g, '-')}`} />
           </div>
-          <button onClick={drucken} className="btn-primary w-full print:hidden">
+          <button onClick={() => window.print()} className="btn-primary w-full print:hidden">
             <Printer className="h-5 w-5" /> QR-Schild drucken
           </button>
         </div>
@@ -304,3 +385,9 @@ export default function MaschineDetail() {
     </div>
   )
 }
+
+/** Abschlussdatum, sonst Fertigmeldung, sonst Erstellung. */
+const datumVon = (r) => r.approved_at || r.completed_at || r.created_at
+/** Ausführender Techniker: Fertigmelder, sonst Starter der Bearbeitung, sonst Zuständiger. */
+const technikerVon = (r) =>
+  r.ausfuehrer?.full_name || r.starter?.full_name || r.zustaendig?.full_name || '–'
